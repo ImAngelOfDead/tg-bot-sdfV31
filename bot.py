@@ -165,32 +165,102 @@ def get_last_shift_times(user_id: int):
     row = cursor.fetchone()
     return (st_time, row[0]) if row else (st_time, None)
 
+def get_user_reminder(user_id: int):
+    cursor.execute("SELECT reminder FROM users WHERE id = %s", (user_id,))
+    row = cursor.fetchone()
+    return row[0] if row and row[0] else ""
+
+# Словарь для хранения текущей страницы календаря для каждого пользователя
 user_dayoff_pages = {}
 
-def build_day_off_reply_keyboard(page_start: datetime.date) -> ReplyKeyboardMarkup:
+def build_day_off_inline_keyboard(user_id: int, page_start: datetime.date) -> InlineKeyboardMarkup:
     today = datetime.date.today()
     min_date = today + datetime.timedelta(days=MIN_DATE_OFFSET)
     max_date = today + datetime.timedelta(days=MAX_DATE_OFFSET)
     if page_start < min_date:
         page_start = min_date
 
-    keyboard_rows = []
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[], row_width=1)
     current_date = page_start
+    # Добавляем кнопки с доступными датами
     for _ in range(PAGE_SIZE):
         if current_date > max_date:
             break
-        keyboard_rows.append([KeyboardButton(text=current_date.strftime("%d.%m.%Y"))])
+        cursor.execute("SELECT COUNT(*) FROM weekends WHERE date = %s", (current_date,))
+        count = cursor.fetchone()[0]
+        if count == 0:
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=current_date.strftime("%d.%m.%Y"),
+                    callback_data=f"day_off_select:{current_date.strftime('%Y-%m-%d')}"
+                )
+            ])
         current_date += datetime.timedelta(days=1)
 
-    nav_row = []
+    # Формируем ряд навигационных кнопок
+    nav_buttons = []
     if page_start > min_date:
-        nav_row.append(KeyboardButton(text="←"))
+        nav_buttons.append(InlineKeyboardButton(text="←", callback_data="day_off_prev"))
     if current_date <= max_date:
-        nav_row.append(KeyboardButton(text="→"))
-    nav_row.append(KeyboardButton(text="Назад"))
-    keyboard_rows.append(nav_row)
+        nav_buttons.append(InlineKeyboardButton(text="→", callback_data="day_off_next"))
+    nav_buttons.append(InlineKeyboardButton(text="Назад", callback_data="day_off_back"))
+    if nav_buttons:
+        keyboard.inline_keyboard.append(nav_buttons)
+    return keyboard
 
-    return ReplyKeyboardMarkup(keyboard=keyboard_rows, resize_keyboard=True)
+
+@dp.message(lambda msg: msg.text == BUTTON_DAY_OFF)
+async def ask_day_off_date(message: types.Message):
+    user_id = get_or_create_user(str(message.from_user.id))
+    today = datetime.date.today()
+    min_date = today + datetime.timedelta(days=MIN_DATE_OFFSET)
+    user_dayoff_pages[user_id] = min_date
+    kb = build_day_off_inline_keyboard(user_id, min_date)
+    await message.answer("Выберите дату для выходного:", reply_markup=kb)
+
+@dp.callback_query(lambda c: c.data.startswith("day_off_select:"))
+async def handle_day_off_select(callback_query: types.CallbackQuery):
+    user_id = get_or_create_user(str(callback_query.from_user.id))
+    date_str = callback_query.data.split(":")[1]
+    selected_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    # Проверяем доступность даты
+    cursor.execute("SELECT COUNT(*) FROM weekends WHERE date = %s", (selected_date,))
+    count = cursor.fetchone()[0]
+    if count > 0:
+        await callback_query.answer("Этот день уже занят.", show_alert=True)
+    else:
+        cursor.execute("INSERT INTO weekends (user_id, date) VALUES (%s, %s)", (user_id, selected_date))
+        conn.commit()
+        await callback_query.message.edit_text(f"Выходной на {selected_date.strftime('%d.%m.%Y')} установлен.")
+        await bot.send_message(callback_query.from_user.id, TEXT_MENU, reply_markup=menu_keyboard)
+    user_dayoff_pages.pop(user_id, None)
+
+@dp.callback_query(lambda c: c.data in ["day_off_prev", "day_off_next", "day_off_back"])
+async def day_off_navigation(callback_query: types.CallbackQuery):
+    user_id = get_or_create_user(str(callback_query.from_user.id))
+    if callback_query.data == "day_off_back":
+        user_dayoff_pages.pop(user_id, None)
+        await callback_query.message.edit_text(TEXT_MENU, reply_markup=menu_keyboard)
+        return
+
+    page_start = user_dayoff_pages.get(user_id)
+    if not page_start:
+        page_start = datetime.date.today() + datetime.timedelta(days=MIN_DATE_OFFSET)
+
+    today = datetime.date.today()
+    if callback_query.data == "day_off_prev":
+        new_start = page_start - datetime.timedelta(days=PAGE_SIZE)
+        min_date = today + datetime.timedelta(days=MIN_DATE_OFFSET)
+        if new_start < min_date:
+            new_start = min_date
+    elif callback_query.data == "day_off_next":
+        new_start = page_start + datetime.timedelta(days=PAGE_SIZE)
+        max_date = today + datetime.timedelta(days=MAX_DATE_OFFSET)
+        if new_start > max_date:
+            new_start = max_date
+    user_dayoff_pages[user_id] = new_start
+    kb = build_day_off_inline_keyboard(user_id, new_start)
+    await callback_query.message.edit_reply_markup(reply_markup=kb)
 
 menu_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -286,8 +356,12 @@ async def confirm_end_shift(callback_query: types.CallbackQuery):
     user_id = get_or_create_user(str(callback_query.from_user.id))
     insert_operation(user_id, OPERATION_END_SHIFT)
     end_time = get_last_operation_time(user_id, OPERATION_END_SHIFT)
+    reminder_text = get_user_reminder(user_id)
+    response_text = f"Смена завершена в {format_time(end_time)}."
+    if reminder_text:
+        response_text += f"\nНапоминание: {reminder_text}"
     await callback_query.answer()
-    await callback_query.message.edit_text(f"Смена завершена в {format_time(end_time)}")
+    await callback_query.message.edit_text(response_text)
     await bot.send_message(callback_query.from_user.id, TEXT_MENU, reply_markup=menu_keyboard)
 
 @dp.callback_query(lambda c: c.data == CALLBACK_CANCEL_END_SHIFT)
@@ -295,72 +369,6 @@ async def cancel_end_shift(callback_query: types.CallbackQuery):
     await callback_query.answer()
     await callback_query.message.edit_text("Операция отменена.")
     await bot.send_message(callback_query.from_user.id, TEXT_MENU, reply_markup=menu_keyboard)
-
-@dp.message(lambda msg: msg.text == BUTTON_DAY_OFF)
-async def ask_day_off_date(message: types.Message):
-    user_id = get_or_create_user(str(message.from_user.id))
-    today = datetime.date.today()
-    min_date = today + datetime.timedelta(days=MIN_DATE_OFFSET)
-    user_dayoff_pages[user_id] = min_date
-    kb = build_day_off_reply_keyboard(min_date)
-    await message.answer("Выберите дату для выходного:", reply_markup=kb)
-
-@dp.message(lambda msg: msg.text 
-            and get_or_create_user(str(msg.from_user.id)) in user_dayoff_pages 
-            and (msg.text in ["Назад", "→", "←"] or re.fullmatch(DATE_REGEX, msg.text)))
-async def day_off_selection(message: types.Message):
-    user_id = get_or_create_user(str(message.from_user.id))
-    page_start = user_dayoff_pages[user_id]
-    today = datetime.date.today()
-    min_date = today + datetime.timedelta(days=MIN_DATE_OFFSET)
-    max_date = today + datetime.timedelta(days=MAX_DATE_OFFSET)
-
-    if message.text == "Назад":
-        user_dayoff_pages.pop(user_id, None)
-        await message.answer(TEXT_MENU, reply_markup=menu_keyboard)
-        return
-    elif message.text == "→":
-        new_start = page_start + datetime.timedelta(days=PAGE_SIZE)
-        if new_start > max_date:
-            new_start = max_date
-        user_dayoff_pages[user_id] = new_start
-        kb = build_day_off_reply_keyboard(new_start)
-        await message.answer("Выберите дату для выходного:", reply_markup=kb)
-        return
-    elif message.text == "←":
-        new_start = page_start - datetime.timedelta(days=PAGE_SIZE)
-        if new_start < min_date:
-            new_start = min_date
-        user_dayoff_pages[user_id] = new_start
-        kb = build_day_off_reply_keyboard(new_start)
-        await message.answer("Выберите дату для выходного:", reply_markup=kb)
-        return
-    else:
-        try:
-            selected_date = datetime.datetime.strptime(message.text, "%d.%m.%Y").date()
-        except ValueError:
-            return
-
-        displayed_dates = []
-        cur_date = page_start
-        for _ in range(PAGE_SIZE):
-            if cur_date > max_date:
-                break
-            displayed_dates.append(cur_date)
-            cur_date += datetime.timedelta(days=1)
-
-        if selected_date not in displayed_dates:
-            return
-
-        cursor.execute("SELECT COUNT(*) FROM weekends WHERE date = %s", (selected_date,))
-        count = cursor.fetchone()[0]
-        if count > 0:
-            await message.answer("Этот день уже занят кем-то из отдела.")
-        else:
-            cursor.execute("INSERT INTO weekends (user_id, date) VALUES (%s, %s)", (user_id, selected_date))
-            conn.commit()
-            await message.answer(f"Выходной на {selected_date.strftime('%d.%m.%Y')} установлен.", reply_markup=menu_keyboard)
-        user_dayoff_pages.pop(user_id, None)
 
 @dp.message(lambda msg: msg.text == BUTTON_WORK_TIME)
 async def work_time(message: types.Message):
