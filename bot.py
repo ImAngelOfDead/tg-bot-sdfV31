@@ -349,20 +349,23 @@ async def request_end_shift(message: types.Message):
     if not is_shift_active(user_id):
         await message.answer("Нет активной смены.")
         return
-    await message.answer("Завершить смену?", reply_markup=confirm_shift_keyboard)
+    reminder_text = get_user_reminder(user_id)
+    confirm_text = "Завершить смену?"
+    if reminder_text:
+        confirm_text += f"\nНапоминание: {reminder_text}"
+    await message.answer(confirm_text, reply_markup=confirm_shift_keyboard)
+
 
 @dp.callback_query(lambda c: c.data == CALLBACK_CONFIRM_END_SHIFT)
 async def confirm_end_shift(callback_query: types.CallbackQuery):
     user_id = get_or_create_user(str(callback_query.from_user.id))
     insert_operation(user_id, OPERATION_END_SHIFT)
     end_time = get_last_operation_time(user_id, OPERATION_END_SHIFT)
-    reminder_text = get_user_reminder(user_id)
     response_text = f"Смена завершена в {format_time(end_time)}."
-    if reminder_text:
-        response_text += f"\nНапоминание: {reminder_text}"
     await callback_query.answer()
     await callback_query.message.edit_text(response_text)
     await bot.send_message(callback_query.from_user.id, TEXT_MENU, reply_markup=menu_keyboard)
+
 
 @dp.callback_query(lambda c: c.data == CALLBACK_CANCEL_END_SHIFT)
 async def cancel_end_shift(callback_query: types.CallbackQuery):
