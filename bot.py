@@ -1,16 +1,23 @@
 import os
 import logging
 import asyncio
-import datetime
 import psycopg2
 import re
+import csv 
+import io
+
+from datetime import datetime, timedelta, date
+from io import BytesIO
 from dotenv import load_dotenv
-
+from openpyxl import Workbook
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.filters import Command 
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from openpyxl.styles import Alignment, Font
 
-load_dotenv()
+load_dotenv()   
 
 # Конфигурация подключения к базе данных
 DB_HOST = os.getenv("DB_HOST")
@@ -35,12 +42,16 @@ PAGE_SIZE = int(os.getenv("PAGE_SIZE", 5))
 # Тексты сообщений и кнопок
 TEXT_WELCOME = os.getenv("TEXT_WELCOME", "Привет! Выбери действие:")
 TEXT_MENU = os.getenv("TEXT_MENU", "Главное меню")
+TEXT_ADMIN_REQUIRED = os.getenv("TEXT_ADMIN_REQUIRED", "Требуются права администратора")
+TEXT_INVALID_DATE_FORMAT = os.getenv("TEXT_INVALID_DATE_FORMAT", "Неверный формат даты. Используйте ДД.ММ.ГГГГ")
+TEXT_INVALID_PERIOD = os.getenv("TEXT_INVALID_PERIOD", "Некорректный временной период")
 BUTTON_WORK_TIME = os.getenv("BUTTON_WORK_TIME", "Время работы")
 BUTTON_DAY_OFF = os.getenv("BUTTON_DAY_OFF", "Поставить выходной")
 BUTTON_START_SHIFT = os.getenv("BUTTON_START_SHIFT", "Начать смену")
 BUTTON_START_BREAK = os.getenv("BUTTON_START_BREAK", "Начать перерыв")
 BUTTON_END_SHIFT = os.getenv("BUTTON_END_SHIFT", "Закончить смену")
 BUTTON_END_BREAK = os.getenv("BUTTON_END_BREAK", "Закончить перерыв")
+BUTTON_GET_REPORT = os.getenv("BUTTON_GET_REPORT", "Сформировать отчет")
 
 # Callback данные для inline кнопок
 CALLBACK_CONFIRM_END_SHIFT = os.getenv("CALLBACK_CONFIRM_END_SHIFT", "confirm_end_shift")
@@ -151,6 +162,26 @@ def is_break_active(user_id: int) -> bool:
     """, (user_id, OPERATION_END_BREAK, start_time))
     return cursor.fetchone()[0] == 0
 
+def calculate_break_duration(user_id: int, shift_start: datetime, shift_end: datetime) -> timedelta:
+    total_break = timedelta()
+    cursor.execute("""
+        SELECT operation, created_at 
+        FROM operations 
+        WHERE user_id = %s 
+            AND operation IN (%s, %s) 
+            AND created_at BETWEEN %s AND %s
+        ORDER BY created_at
+    """, (user_id, OPERATION_START_BREAK, OPERATION_END_BREAK, shift_start, shift_end or datetime.now()))
+    
+    start_break = None
+    for op_type, op_time in cursor.fetchall():
+        if op_type == OPERATION_START_BREAK:
+            start_break = op_time
+        elif op_type == OPERATION_END_BREAK and start_break:
+            total_break += op_time - start_break
+            start_break = None
+    return total_break
+
 def get_last_shift_times(user_id: int):
     st_time = get_last_operation_time(user_id, OPERATION_START_SHIFT)
     if not st_time:
@@ -222,7 +253,7 @@ async def ask_day_off_date(message: types.Message):
 async def handle_day_off_select(callback_query: types.CallbackQuery):
     user_id = get_or_create_user(str(callback_query.from_user.id))
     date_str = callback_query.data.split(":")[1]
-    selected_date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    selected_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     # Проверяем доступность даты
     cursor.execute("SELECT COUNT(*) FROM weekends WHERE date = %s", (selected_date,))
     count = cursor.fetchone()[0]
@@ -266,7 +297,8 @@ menu_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BUTTON_WORK_TIME), KeyboardButton(text=BUTTON_DAY_OFF)],
         [KeyboardButton(text=BUTTON_START_SHIFT), KeyboardButton(text=BUTTON_START_BREAK),
-         KeyboardButton(text=BUTTON_END_SHIFT), KeyboardButton(text=BUTTON_END_BREAK)]
+         KeyboardButton(text=BUTTON_END_SHIFT), KeyboardButton(text=BUTTON_END_BREAK)],
+        [KeyboardButton(text=BUTTON_GET_REPORT)]
     ],
     resize_keyboard=True
 )
@@ -284,7 +316,43 @@ confirm_break_keyboard = InlineKeyboardMarkup(inline_keyboard=[
 @dp.message(Command("start"))
 async def start_command(message: types.Message):
     await message.answer(TEXT_WELCOME, reply_markup=menu_keyboard)
+    
+@dp.message(Command("get"))
+async def handle_get_report(message: types.Message, state: FSMContext):
+    user_id = get_or_create_user(str(message.from_user.id))
+    cursor.execute("SELECT is_admin FROM users WHERE id = %s", (user_id,))
+    if not cursor.fetchone()[0]:
+        await message.answer(TEXT_ADMIN_REQUIRED)
+        return
 
+    try:
+        args = message.text.split()[1:]
+        if len(args) < 2:
+            await message.answer("Укажите две даты: ДД.ММ.ГГГГ ДД.ММ.ГГГГ")
+            return
+
+        date_from = datetime.strptime(args[0], "%d.%m.%Y").date()
+        date_to = datetime.strptime(args[1], "%d.%m.%Y").date()
+
+        if date_from > date_to:
+            await message.answer(TEXT_INVALID_PERIOD)
+            return
+
+        await state.update_data(date_from=date_from, date_to=date_to)
+        await state.set_state(ReportStates.WAITING_FOR_FORMAT)
+
+        format_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="CSV")],
+                [KeyboardButton(text="Excel")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer("Выберите формат отчёта:", reply_markup=format_keyboard)
+
+    except ValueError:
+        await message.answer(TEXT_INVALID_DATE_FORMAT)
+        
 @dp.message(lambda msg: msg.text == BUTTON_START_SHIFT)
 async def start_shift(message: types.Message):
     user_id = get_or_create_user(str(message.from_user.id))
@@ -355,6 +423,204 @@ async def request_end_shift(message: types.Message):
         confirm_text += f"\nНапоминание: {reminder_text}"
     await message.answer(confirm_text, reply_markup=confirm_shift_keyboard)
 
+class ReportStates(StatesGroup):
+    WAITING_FOR_DATE_FROM = State()
+    WAITING_FOR_DATE_TO = State()
+    WAITING_FOR_FORMAT = State()
+
+@dp.message(lambda msg: msg.text == BUTTON_GET_REPORT)
+async def request_report(message: types.Message, state: FSMContext):
+    user_id = get_or_create_user(str(message.from_user.id))
+    cursor.execute("SELECT is_admin FROM users WHERE id = %s", (user_id,))
+    if not cursor.fetchone()[0]:
+        await message.answer(TEXT_ADMIN_REQUIRED)
+        return
+
+    await state.set_state(ReportStates.WAITING_FOR_DATE_FROM)
+    await message.answer("Введите дату начала отчёта в формате ДД.ММ.ГГГГ:")
+
+# Обработчик ввода даты "от"
+@dp.message(ReportStates.WAITING_FOR_DATE_FROM)
+async def handle_date_from(message: types.Message, state: FSMContext):
+    try:
+        date_from = datetime.strptime(message.text, "%d.%m.%Y").date()
+        await state.update_data(date_from=date_from)
+        await state.set_state(ReportStates.WAITING_FOR_DATE_TO)
+        await message.answer("Введите дату окончания отчёта в формате ДД.ММ.ГГГГ:")
+    except ValueError:
+        await message.answer(TEXT_INVALID_DATE_FORMAT)
+
+# Обработчик ввода даты "до"
+@dp.message(ReportStates.WAITING_FOR_DATE_TO)
+async def handle_date_to(message: types.Message, state: FSMContext):
+    try:
+        date_to = datetime.strptime(message.text, "%d.%m.%Y").date()
+        data = await state.get_data()
+        date_from = data["date_from"]
+
+        if date_from > date_to:
+            await message.answer(TEXT_INVALID_PERIOD)
+            return
+
+        await state.update_data(date_to=date_to)
+        await state.set_state(ReportStates.WAITING_FOR_FORMAT)
+
+        format_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="CSV")],
+                [KeyboardButton(text="Excel")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer("Выберите формат отчёта:", reply_markup=format_keyboard)
+    except ValueError:
+        await message.answer(TEXT_INVALID_DATE_FORMAT)
+
+# Обработчик выбора формата
+@dp.message(ReportStates.WAITING_FOR_FORMAT)
+async def handle_format_choice(message: types.Message, state: FSMContext):
+    format_choice = message.text.lower()
+    if format_choice not in ["csv", "excel"]:
+        await message.answer("Пожалуйста, выберите формат: CSV или Excel.")
+        return
+
+    data = await state.get_data()
+    date_from = data["date_from"]
+    date_to = data["date_to"]
+
+    if format_choice == "csv":
+        report_file = await generate_report_csv(date_from, date_to)
+        filename = f"report_{date_from}_{date_to}.csv"
+    else:
+        report_file = await generate_report_excel(date_from, date_to)
+        filename = f"report_{date_from}_{date_to}.xlsx"
+
+    await message.answer_document(
+        document=types.BufferedInputFile(
+            report_file.getvalue(),
+            filename=filename
+        )
+    )
+
+    await state.clear()
+    await message.answer("Отчёт отправлен.", reply_markup=types.ReplyKeyboardRemove())
+    await message.answer(TEXT_MENU, reply_markup=menu_keyboard)
+
+# Функция генерации CSV-отчёта
+async def generate_report_csv(start_date: date, end_date: date) -> BytesIO:
+    output = io.StringIO(newline='')
+    writer = csv.writer(output, delimiter=';')
+
+    cursor.execute("SELECT id, full_name FROM users")
+    for user_id, full_name in cursor.fetchall():
+        writer.writerow([full_name])
+        writer.writerow(["Дата", "Начало смены", "Конец смены", "Перерывы"])
+
+        cursor.execute("""
+            SELECT created_at 
+            FROM operations 
+            WHERE user_id = %s 
+                AND operation = %s 
+                AND created_at::date BETWEEN %s AND %s
+            ORDER BY created_at
+        """, (user_id, OPERATION_START_SHIFT, start_date, end_date))
+        
+        for shift_start_row in cursor.fetchall():
+            shift_start = shift_start_row[0]
+            
+            cursor.execute("""
+                SELECT created_at 
+                FROM operations 
+                WHERE user_id = %s 
+                    AND operation = %s 
+                    AND created_at > %s 
+                ORDER BY created_at 
+                LIMIT 1
+            """, (user_id, OPERATION_END_SHIFT, shift_start))
+            shift_end_row = cursor.fetchone()
+            shift_end = shift_end_row[0] if shift_end_row else None
+            
+            break_duration = calculate_break_duration(user_id, shift_start, shift_end)
+            total_seconds = int(break_duration.total_seconds())
+            minutes, seconds = divmod(total_seconds, 60)
+            break_duration_str = f"{minutes}:{seconds:02d}"
+
+            writer.writerow([
+                shift_start.date().strftime("%d.%m.%Y"),
+                shift_start.time().strftime("%H:%M"),
+                shift_end.time().strftime("%H:%M") if shift_end else 'Не завершена',
+                break_duration_str
+            ])
+
+        writer.writerow([])
+
+    output.seek(0)
+    return BytesIO(output.getvalue().encode())
+
+# Функция генерации Excel-отчёта
+async def generate_report_excel(start_date: date, end_date: date) -> BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Отчёт"
+
+    header_font = Font(bold=True)
+    center_alignment = Alignment(horizontal="center")
+
+    cursor.execute("SELECT id, full_name FROM users")
+    for user_id, full_name in cursor.fetchall():
+        ws.append([full_name])
+        ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=4)
+        ws.cell(row=ws.max_row, column=1).font = header_font
+        ws.cell(row=ws.max_row, column=1).alignment = center_alignment
+
+        ws.append(["Дата", "Начало смены", "Конец смены", "Перерывы"])
+        for col in range(1, 5):
+            ws.cell(row=ws.max_row, column=col).font = header_font
+            ws.cell(row=ws.max_row, column=col).alignment = center_alignment
+
+        cursor.execute("""
+            SELECT created_at 
+            FROM operations 
+            WHERE user_id = %s 
+                AND operation = %s 
+                AND created_at::date BETWEEN %s AND %s
+            ORDER BY created_at
+        """, (user_id, OPERATION_START_SHIFT, start_date, end_date))
+        
+        for shift_start_row in cursor.fetchall():
+            shift_start = shift_start_row[0]
+            
+            cursor.execute("""
+                SELECT created_at 
+                FROM operations 
+                WHERE user_id = %s 
+                    AND operation = %s 
+                    AND created_at > %s 
+                ORDER BY created_at 
+                LIMIT 1
+            """, (user_id, OPERATION_END_SHIFT, shift_start))
+            shift_end_row = cursor.fetchone()
+            shift_end = shift_end_row[0] if shift_end_row else None
+            
+            break_duration = calculate_break_duration(user_id, shift_start, shift_end)
+            
+            total_seconds = int(break_duration.total_seconds())
+            minutes, seconds = divmod(total_seconds, 60)
+            break_duration_str = f"{minutes}:{seconds:02d}"
+
+            ws.append([
+                shift_start.date().strftime("%d.%m.%Y"),  
+                shift_start.time().strftime("%H:%M"),    
+                shift_end.time().strftime("%H:%M") if shift_end else 'Не завершена',  
+                break_duration_str                        
+            ])
+
+        ws.append([])
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output
 
 @dp.callback_query(lambda c: c.data == CALLBACK_CONFIRM_END_SHIFT)
 async def confirm_end_shift(callback_query: types.CallbackQuery):
